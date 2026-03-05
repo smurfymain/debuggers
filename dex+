@@ -1020,7 +1020,7 @@ local EmbeddedModules = {
 			local Explorer = {}
 			local tree, listEntries, explorerOrders, searchResults, specResults = {}, {}, {}, {}, {}
 			local expanded
-			local entryTemplate, treeFrame, toolBar, descendantAddedCon, descendantRemovingCon, itemChangedCon
+			local entryTemplate, treeFrame, toolBar, scrollCorner, descendantAddedCon, descendantRemovingCon, itemChangedCon
 			local ffa = game.FindFirstAncestorWhichIsA
 			local getDescendants = game.GetDescendants
 			local getTextSize = service.TextService.GetTextSize
@@ -1034,9 +1034,27 @@ local EmbeddedModules = {
 			local nilMap, nilCons = {}, {}
 			local connectSignal = game.DescendantAdded.Connect
 			local addObject, removeObject, moveObject = nil, nil, nil
+			local collectRemoteObjectsFromRoots
+			local startRemoteExportLogging
+			local stopRemoteExportLogging
+			local exportDecompiledRoots
+			local updateExportToolbarButtonVisual
+			local updateRemoteToolbarButtonVisual
 
 			local iconData
 			local remote_blocklist = {} -- list of remotes beng blocked, k = the remote instance, v = their old function :3
+			local remote_export_active = false
+			local remote_export_targets = {}
+			local remote_export_signal_map = {}
+			local remote_export_hooks_installed = false
+			local remote_export_namecall_hook
+			local remote_export_newindex_hook
+			local remote_export_session = nil
+			local remote_export_seq = 0
+			local remote_export_wrapped_functions = setmetatable({}, { __mode = "k" })
+			local remote_export_desc_added_con
+			local remote_export_desc_removed_con
+			local export_job_active = false
 			nodes = nodes or {}
 
 			addObject = function(root)
@@ -2137,6 +2155,10 @@ local EmbeddedModules = {
 					"EXPORT_DECOMPILED_FOLDER",
 					env.decompile == nil or env.writefile == nil or env.makefolder == nil or #sList == 0
 				)
+				context:AddRegistered(
+					"EXPORT_ALL_DECOMPILED_SCRIPTS",
+					env.decompile == nil or env.writefile == nil or env.makefolder == nil
+				)
 				-- context:AddRegistered("CALL_FUNCTION")
 				-- context:AddRegistered("VIEW_CONNECTIONS")
 				-- context:AddRegistered("GET_REFERENCES")
@@ -2186,6 +2208,27 @@ local EmbeddedModules = {
 				end
 				if presentClasses["UnreliableRemoteEvent"] then
 					context:AddRegistered("UNBLOCK_REMOTE", env.hookfunction == nil)
+				end
+				if presentClasses["RemoteEvent"] or presentClasses["RemoteFunction"] or presentClasses["UnreliableRemoteEvent"] then
+					context:AddRegistered(
+						"EXPORT_REMOTE_INVENTORY",
+						env.writefile == nil or env.makefolder == nil
+					)
+					context:AddRegistered(
+						"START_REMOTE_EXPORT_ALL",
+						env.writefile == nil or env.makefolder == nil or env.hookmetamethod == nil or remote_export_active
+					)
+					context:AddRegistered(
+						"START_REMOTE_EXPORT_LOG",
+						env.writefile == nil or env.makefolder == nil or env.hookmetamethod == nil or remote_export_active
+					)
+					context:AddRegistered(
+						"STOP_REMOTE_EXPORT_LOG",
+						env.writefile == nil
+							or env.makefolder == nil
+							or env.hookmetamethod == nil
+							or not remote_export_active
+					)
 				end
 
 				if presentClasses["BindableEvent"] then
@@ -2288,7 +2331,7 @@ local EmbeddedModules = {
 					return segments
 				end
 
-				local function collectDecompilableScripts(rootObj)
+				local function collectDecompilableScripts(rootObj, yieldEvery)
 					local out = {}
 					if rootObj:IsA("LuaSourceContainer") and env.isViableDecompileScript(rootObj) then
 						out[#out + 1] = rootObj
@@ -2300,6 +2343,9 @@ local EmbeddedModules = {
 							local obj = descs[i]
 							if obj:IsA("LuaSourceContainer") and env.isViableDecompileScript(obj) then
 								out[#out + 1] = obj
+							end
+							if yieldEvery and yieldEvery > 0 and i % yieldEvery == 0 then
+								task.wait()
 							end
 						end
 					end
@@ -2335,6 +2381,663 @@ local EmbeddedModules = {
 						scriptObj.ClassName,
 						exportedAt
 					)
+				end
+
+				local function getInstanceFullName(obj)
+					local success, fullName = pcall(obj.GetFullName, obj)
+					if success and type(fullName) == "string" and #fullName > 0 then
+						return fullName
+					end
+					return tostring(obj)
+				end
+
+				local function isRemoteExportClass(obj)
+					return obj
+						and (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") or obj:IsA("UnreliableRemoteEvent"))
+				end
+
+				collectRemoteObjectsFromRoots = function(rootObjects)
+					local remoteList = {}
+					local seen = {}
+					local function addRemote(obj)
+						if obj and isRemoteExportClass(obj) and not seen[obj] then
+							seen[obj] = true
+							remoteList[#remoteList + 1] = obj
+						end
+					end
+
+					for i = 1, #rootObjects do
+						local rootObj = rootObjects[i]
+						addRemote(rootObj)
+						local success, descs = pcall(getDescendants, rootObj)
+						if success and descs then
+							for j = 1, #descs do
+								addRemote(descs[j])
+							end
+						end
+					end
+
+					return remoteList
+				end
+
+				local function getRemoteMetadata(remoteObj)
+					return {
+						name = remoteObj.Name,
+						class = remoteObj.ClassName,
+						path = getInstanceFullName(remoteObj),
+					}
+				end
+
+				local function normalizeForJson(value, depth, seen)
+					depth = depth or 0
+					seen = seen or {}
+					if depth >= 5 then
+						return {
+							__type = "max_depth",
+						}
+					end
+
+					local luaType = type(value)
+					if luaType == "nil" or luaType == "boolean" or luaType == "number" or luaType == "string" then
+						return value
+					end
+
+					local valueType = (typeof and typeof(value)) or luaType
+					if valueType == "Instance" then
+						return {
+							__type = "Instance",
+							class = value.ClassName,
+							name = value.Name,
+							path = getInstanceFullName(value),
+						}
+					end
+
+					if luaType == "table" then
+						if seen[value] then
+							return {
+								__type = "table_ref",
+							}
+						end
+						seen[value] = true
+
+						local output = {}
+						local count = 0
+						for key, entry in next, value do
+							count = count + 1
+							if count > 80 then
+								output.__truncated = true
+								break
+							end
+							output[tostring(key)] = normalizeForJson(entry, depth + 1, seen)
+						end
+
+						return output
+					end
+
+					return {
+						__type = tostring(valueType),
+						value = tostring(value),
+					}
+				end
+
+				local function serializeVarargs(...)
+					local argCount = select("#", ...)
+					local args = {}
+					for i = 1, argCount do
+						args[tostring(i)] = normalizeForJson(select(i, ...), 0, {})
+					end
+					return {
+						count = argCount,
+						values = args,
+					}
+				end
+
+				local function appendLineToFile(filePath, line)
+					if env.appendfile ~= nil then
+						local appendSuccess = pcall(env.appendfile, filePath, line .. "\n")
+						if appendSuccess then
+							return true
+						end
+					end
+
+					local existing = ""
+					if env.readfile ~= nil and env.isfile ~= nil then
+						local isFileSuccess, isFile = pcall(env.isfile, filePath)
+						if isFileSuccess and isFile then
+							local readSuccess, data = pcall(env.readfile, filePath)
+							if readSuccess and type(data) == "string" then
+								existing = data
+							end
+						end
+					end
+
+					local writeSuccess = pcall(env.writefile, filePath, existing .. line .. "\n")
+					return writeSuccess
+				end
+
+				local function writeJsonLine(filePath, payload)
+					local encodeSuccess, encoded = pcall(service.HttpService.JSONEncode, service.HttpService, payload)
+					if not encodeSuccess or type(encoded) ~= "string" then
+						local fallbackSuccess, fallback = pcall(service.HttpService.JSONEncode, service.HttpService, {
+							type = "dex_remote_export_fallback",
+							error = "JSONEncode failed",
+						})
+						encoded = (fallbackSuccess and type(fallback) == "string")
+								and fallback
+							or '{"type":"dex_remote_export_fallback","error":"encode_failed"}'
+					end
+					return appendLineToFile(filePath, encoded)
+				end
+
+				local function createRemoteExportSession(tagName)
+					local stamp = os.date("%Y%m%d_%H%M%S")
+					local folderName = ("dex/saved/remotes/%s_%s_%s"):format(
+						tostring(game.PlaceId),
+						stamp,
+						sanitizeFileName(tagName or "session")
+					)
+					ensureFolder(folderName)
+					return {
+						folder = folderName,
+						createdAt = os.date("%Y-%m-%d %H:%M:%S"),
+						inventoryFile = folderName .. "/inventory.jsonl",
+						callsFile = folderName .. "/calls.jsonl",
+					}
+				end
+
+				local function exportRemoteInventory(remoteList, session)
+					if #remoteList == 0 then
+						return 0, 0, session
+					end
+					local exportSession = session or createRemoteExportSession("inventory")
+					local successCount = 0
+					for i = 1, #remoteList do
+						local remoteObj = remoteList[i]
+						local lineOk = writeJsonLine(exportSession.inventoryFile, {
+							type = "remote_inventory",
+							exportedAt = os.date("%Y-%m-%d %H:%M:%S"),
+							index = i,
+							remote = getRemoteMetadata(remoteObj),
+						})
+						if lineOk then
+							successCount = successCount + 1
+						end
+					end
+					return successCount, #remoteList, exportSession
+				end
+
+				local function updateRemoteExportSignalMap()
+					remote_export_signal_map = {}
+					for remoteObj, _ in pairs(remote_export_targets) do
+						if remoteObj:IsA("RemoteEvent") or remoteObj:IsA("UnreliableRemoteEvent") then
+							local signalSuccess, signalObj = pcall(function()
+								return remoteObj.OnClientEvent
+							end)
+							if signalSuccess and signalObj then
+								remote_export_signal_map[signalObj] = remoteObj
+							end
+						end
+					end
+				end
+
+				local function addRemoteExportTarget(remoteObj)
+					if not remoteObj or not isRemoteExportClass(remoteObj) or remote_export_targets[remoteObj] then
+						return false
+					end
+					remote_export_targets[remoteObj] = remoteObj
+
+					if remoteObj:IsA("RemoteEvent") or remoteObj:IsA("UnreliableRemoteEvent") then
+						local signalSuccess, signalObj = pcall(function()
+							return remoteObj.OnClientEvent
+						end)
+						if signalSuccess and signalObj then
+							remote_export_signal_map[signalObj] = remoteObj
+						end
+					end
+
+					return true
+				end
+
+				local function removeRemoteExportTarget(remoteObj)
+					if not remoteObj or not remote_export_targets[remoteObj] then
+						return false
+					end
+					remote_export_targets[remoteObj] = nil
+
+					if remoteObj:IsA("RemoteEvent") or remoteObj:IsA("UnreliableRemoteEvent") then
+						local signalSuccess, signalObj = pcall(function()
+							return remoteObj.OnClientEvent
+						end)
+						if signalSuccess and signalObj then
+							remote_export_signal_map[signalObj] = nil
+						end
+					end
+
+					return true
+				end
+
+				local function logRemoteCall(callType, remoteObj, methodName, ...)
+					if not remote_export_active or not remote_export_session then
+						return
+					end
+
+					remote_export_seq = remote_export_seq + 1
+					writeJsonLine(remote_export_session.callsFile, {
+						type = "remote_call",
+						callType = callType,
+						sequence = remote_export_seq,
+						loggedAt = os.date("%Y-%m-%d %H:%M:%S"),
+						method = methodName,
+						remote = getRemoteMetadata(remoteObj),
+						args = serializeVarargs(...),
+					})
+				end
+
+				updateExportToolbarButtonVisual = function()
+					local toolbar = Explorer
+						and Explorer.GuiElems
+						and Explorer.GuiElems.ToolBar
+					if not toolbar then
+						return
+					end
+
+					local exportButton = toolbar:FindFirstChild("ExportAll")
+					if not exportButton then
+						return
+					end
+
+					local canExportAll = env.decompile ~= nil and env.writefile ~= nil and env.makefolder ~= nil
+					if not canExportAll then
+						exportButton.Text = "Export Off"
+						exportButton.TextColor3 = Color3.fromRGB(130, 130, 130)
+						exportButton.BackgroundColor3 = Color3.fromRGB(31, 31, 31)
+						exportButton.Active = false
+						return
+					end
+
+					exportButton.Active = true
+					exportButton.TextColor3 = Color3.new(1, 1, 1)
+					if export_job_active then
+						exportButton.Text = "Exporting..."
+						exportButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+					else
+						exportButton.Text = "Export All"
+						exportButton.BackgroundColor3 = Color3.fromRGB(31, 31, 31)
+					end
+				end
+
+				updateRemoteToolbarButtonVisual = function()
+					local toolbar = Explorer
+						and Explorer.GuiElems
+						and Explorer.GuiElems.ToolBar
+					if not toolbar then
+						return
+					end
+
+					local remoteButton = toolbar:FindFirstChild("RemoteAll")
+					if not remoteButton then
+						return
+					end
+
+					local canUseRemoteAll = env.writefile ~= nil and env.makefolder ~= nil and env.hookmetamethod ~= nil
+					if not canUseRemoteAll then
+						remoteButton.Text = "Remote Off"
+						remoteButton.TextColor3 = Color3.fromRGB(130, 130, 130)
+						remoteButton.BackgroundColor3 = Color3.fromRGB(31, 31, 31)
+						remoteButton.Active = false
+						return
+					end
+
+					remoteButton.Active = true
+					remoteButton.TextColor3 = Color3.new(1, 1, 1)
+					if remote_export_active then
+						remoteButton.Text = "Remote Stop"
+						remoteButton.BackgroundColor3 = Color3.fromRGB(96, 44, 44)
+					else
+						remoteButton.Text = "Remote All"
+						remoteButton.BackgroundColor3 = Color3.fromRGB(31, 31, 31)
+					end
+				end
+
+				local function ensureRemoteExportHooks()
+					if remote_export_hooks_installed then
+						return true
+					end
+					if env.hookmetamethod == nil then
+						return false
+					end
+
+					local targetGame = oldgame or game
+					local namecallHook
+					local newindexHook
+
+					local okNamecall = pcall(function()
+						namecallHook = env.hookmetamethod(targetGame, "__namecall", function(self, ...)
+							local method = getnamecallmethod and getnamecallmethod()
+							if remote_export_active and method then
+								local targetRemote = remote_export_targets[self]
+								if targetRemote then
+									if method == "FireServer" or method == "InvokeServer" then
+										logRemoteCall("outgoing", targetRemote, method, ...)
+									end
+								end
+
+								if method == "Connect" then
+									local signalRemote = remote_export_signal_map[self]
+									local callback = select(1, ...)
+									if
+										signalRemote
+										and type(callback) == "function"
+										and not remote_export_wrapped_functions[callback]
+									then
+										local wrappedCallback = function(...)
+											logRemoteCall("incoming_event", signalRemote, "OnClientEvent", ...)
+											return callback(...)
+										end
+										remote_export_wrapped_functions[wrappedCallback] = true
+										return namecallHook(self, wrappedCallback)
+									end
+								end
+							end
+							return namecallHook(self, ...)
+						end)
+					end)
+					if not okNamecall or type(namecallHook) ~= "function" then
+						return false
+					end
+
+					local okNewindex = pcall(function()
+						newindexHook = env.hookmetamethod(targetGame, "__newindex", function(self, key, value)
+							if
+								remote_export_active
+								and remote_export_targets[self]
+								and key == "OnClientInvoke"
+								and type(value) == "function"
+								and not remote_export_wrapped_functions[value]
+							then
+								local original = value
+								local wrappedInvoke = function(...)
+									logRemoteCall("incoming_invoke", self, "OnClientInvoke", ...)
+									return original(...)
+								end
+								remote_export_wrapped_functions[wrappedInvoke] = true
+								return newindexHook(self, key, wrappedInvoke)
+							end
+							return newindexHook(self, key, value)
+						end)
+					end)
+					if not okNewindex or type(newindexHook) ~= "function" then
+						return false
+					end
+
+					remote_export_namecall_hook = namecallHook
+					remote_export_newindex_hook = newindexHook
+					remote_export_hooks_installed = true
+					return true
+				end
+
+				local function setRemoteExportTargets(remoteList)
+					remote_export_targets = {}
+					remote_export_signal_map = {}
+					for i = 1, #remoteList do
+						addRemoteExportTarget(remoteList[i])
+					end
+				end
+
+				startRemoteExportLogging = function(remoteList)
+					if #remoteList == 0 then
+						return false, "no remotes selected"
+					end
+					if not ensureRemoteExportHooks() then
+						return false, "hookmetamethod unavailable"
+					end
+					local session = createRemoteExportSession("live_log")
+					remote_export_session = session
+					remote_export_seq = 0
+					setRemoteExportTargets(remoteList)
+					remote_export_active = true
+
+					if remote_export_desc_added_con then
+						remote_export_desc_added_con:Disconnect()
+						remote_export_desc_added_con = nil
+					end
+					if remote_export_desc_removed_con then
+						remote_export_desc_removed_con:Disconnect()
+						remote_export_desc_removed_con = nil
+					end
+
+					remote_export_desc_added_con = (oldgame or game).DescendantAdded:Connect(function(obj)
+						if not remote_export_active then
+							return
+						end
+						if addRemoteExportTarget(obj) then
+							logRemoteCall("remote_added", obj, "DescendantAdded")
+						end
+					end)
+					remote_export_desc_removed_con = (oldgame or game).DescendantRemoving:Connect(function(obj)
+						if not remote_export_active then
+							return
+						end
+						if removeRemoteExportTarget(obj) then
+							logRemoteCall("remote_removed", obj, "DescendantRemoving")
+						end
+					end)
+
+					writeJsonLine(session.callsFile, {
+						type = "session_start",
+						loggedAt = os.date("%Y-%m-%d %H:%M:%S"),
+						remoteCount = #remoteList,
+					})
+					exportRemoteInventory(remoteList, session)
+					updateRemoteToolbarButtonVisual()
+					return true, session
+				end
+
+				stopRemoteExportLogging = function()
+					if not remote_export_active then
+						return false
+					end
+					if remote_export_session then
+						writeJsonLine(remote_export_session.callsFile, {
+							type = "session_stop",
+							loggedAt = os.date("%Y-%m-%d %H:%M:%S"),
+							totalLogged = remote_export_seq,
+						})
+					end
+					remote_export_active = false
+					if remote_export_desc_added_con then
+						remote_export_desc_added_con:Disconnect()
+						remote_export_desc_added_con = nil
+					end
+					if remote_export_desc_removed_con then
+						remote_export_desc_removed_con:Disconnect()
+						remote_export_desc_removed_con = nil
+					end
+					remote_export_targets = {}
+					remote_export_signal_map = {}
+					updateRemoteToolbarButtonVisual()
+					return true
+				end
+
+				exportDecompiledRoots = function(rootObjects, tagName)
+					if env.decompile == nil or env.writefile == nil or env.makefolder == nil then
+						return false
+					end
+					if #rootObjects == 0 then
+						return false
+					end
+					if export_job_active then
+						warn("DEX export is already running. Please wait for it to finish.")
+						return false
+					end
+
+					local exportTag = tagName or "folder"
+					local collectYieldEvery = 300
+					local writeYieldEvery = 8
+					local progressEvery = 40
+					export_job_active = true
+					updateExportToolbarButtonVisual()
+
+					task.spawn(function()
+						local startedAt = os.clock()
+						local successRun, runErr = pcall(function()
+							local batchStamp = os.date("%Y%m%d_%H%M%S")
+							local exportedAt = os.date("%Y-%m-%d %H:%M:%S")
+							local rootFolderName = "dex/saved"
+							ensureFolder(rootFolderName)
+
+							local rootBatches = {}
+							local expectedTotal = 0
+							warn(("DEX %s export preparing script list..."):format(exportTag))
+							for i = 1, #rootObjects do
+								local rootObj = rootObjects[i]
+								local scripts = collectDecompilableScripts(rootObj, collectYieldEvery)
+								rootBatches[#rootBatches + 1] = {
+									rootObj = rootObj,
+									rootIndex = i,
+									scripts = scripts,
+								}
+								expectedTotal = expectedTotal + #scripts
+								warn(
+									("DEX %s scan %i/%i | root=%s scripts=%i"):format(
+										exportTag,
+										i,
+										#rootObjects,
+										getInstanceFullName(rootObj),
+										#scripts
+									)
+								)
+							end
+
+							warn(
+								("DEX %s export started | roots=%i scripts=%i"):format(
+									exportTag,
+									#rootObjects,
+									expectedTotal
+								)
+							)
+
+							local totalScripts, totalSuccess, totalFailed = 0, 0, 0
+							local lastProgressAt = 0
+							local failureSamples = {}
+							local function reportProgress(force)
+								if not force and (totalScripts - lastProgressAt) < progressEvery then
+									return
+								end
+								lastProgressAt = totalScripts
+								local percent = expectedTotal > 0 and math.floor((totalScripts / expectedTotal) * 100) or 100
+								warn(
+									("DEX %s export progress | %i/%i (%i%%) success=%i failed=%i"):format(
+										exportTag,
+										totalScripts,
+										expectedTotal,
+										percent,
+										totalSuccess,
+										totalFailed
+									)
+								)
+							end
+
+							for batchIndex = 1, #rootBatches do
+								local batch = rootBatches[batchIndex]
+								local rootObj = batch.rootObj
+								local scripts = batch.scripts
+								local exportFolder = ("%s/%s_%s_%s_%s_%i"):format(
+									rootFolderName,
+									tostring(game.PlaceId),
+									sanitizeFileName(rootObj.ClassName),
+									sanitizeFileName(rootObj.Name),
+									batchStamp,
+									batch.rootIndex
+								)
+								ensureFolder(exportFolder)
+
+								local folderNameMap = {}
+								for ind = 1, #scripts do
+									local scriptObj = scripts[ind]
+									totalScripts = totalScripts + 1
+
+									local relativeSegments = getRelativeFolderSegments(rootObj, scriptObj)
+									local scriptFolder = exportFolder
+									if relativeSegments and #relativeSegments > 0 then
+										scriptFolder = scriptFolder .. "/" .. concat(relativeSegments, "/")
+										ensureFolder(scriptFolder)
+									end
+
+									local stem = ("%s.%s"):format(
+										sanitizeFileName(scriptObj.Name),
+										sanitizeFileName(scriptObj.ClassName)
+									)
+									local scriptFile = scriptFolder
+										.. "/"
+										.. getUniqueFileName(folderNameMap, scriptFolder, stem)
+									local decompileOk, source = pcall(env.decompile, scriptObj)
+									local writeStateOk = decompileOk and type(source) == "string"
+									local decompileErr = decompileOk and nil or tostring(source)
+									local output
+
+									if writeStateOk then
+										output = buildScriptHeader(scriptObj, exportedAt) .. source
+									else
+										output = buildScriptHeader(scriptObj, exportedAt)
+											.. ("-- Failed to decompile script.\n-- Error: %s\n"):format(
+												tostring(source)
+											)
+									end
+
+									local writeSuccess, writeErr = pcall(env.writefile, scriptFile, output)
+									if not writeSuccess then
+										writeStateOk = false
+										if not decompileErr then
+											decompileErr = "writefile failed: " .. tostring(writeErr)
+										end
+									end
+
+									if writeStateOk then
+										totalSuccess = totalSuccess + 1
+									else
+										totalFailed = totalFailed + 1
+										if #failureSamples < 5 then
+											failureSamples[#failureSamples + 1] = ("%s (%s) => %s"):format(
+												getInstanceFullName(scriptObj),
+												scriptObj.ClassName,
+												decompileErr or "unknown"
+											)
+										end
+									end
+
+									reportProgress(false)
+									if ind % writeYieldEvery == 0 then
+										task.wait()
+									end
+								end
+								task.wait()
+							end
+
+							reportProgress(true)
+							local elapsed = os.clock() - startedAt
+							warn(
+								("DEX %s export completed | scripts=%i success=%i failed=%i time=%.2fs"):format(
+									exportTag,
+									totalScripts,
+									totalSuccess,
+									totalFailed,
+									elapsed
+								)
+							)
+							if #failureSamples > 0 then
+								warn("DEX export sample failures:\n- " .. table.concat(failureSamples, "\n- "))
+							end
+						end)
+
+						if not successRun then
+							warn(("DEX %s export crashed: %s"):format(exportTag, tostring(runErr)))
+						end
+						export_job_active = false
+						updateExportToolbarButtonVisual()
+					end)
+
+					return true
 				end
 
 				context:Register("CUT", {
@@ -2922,85 +3625,20 @@ local EmbeddedModules = {
 					IconMap = Explorer.MiscIcons,
 					Icon = "Save",
 					OnClick = function()
-						if env.decompile == nil or env.writefile == nil or env.makefolder == nil then
-							return
-						end
-
+						local roots = {}
 						local sList = selection.List
-						if #sList == 0 then
-							return
-						end
-
-						local batchStamp = os.date("%Y%m%d_%H%M%S")
-						local exportedAt = os.date("%Y-%m-%d %H:%M:%S")
-						local totalScripts, totalSuccess, totalFailed = 0, 0, 0
-						local rootFolderName = "dex/saved"
-						ensureFolder(rootFolderName)
-
 						for i = 1, #sList do
-							local rootObj = sList[i].Obj
-							local exportFolder = ("%s/%s_%s_%s_%s_%i"):format(
-								rootFolderName,
-								tostring(game.PlaceId),
-								sanitizeFileName(rootObj.ClassName),
-								sanitizeFileName(rootObj.Name),
-								batchStamp,
-								i
-							)
-							ensureFolder(exportFolder)
-
-							local scripts = collectDecompilableScripts(rootObj)
-							local folderNameMap = {}
-							for ind = 1, #scripts do
-								local scriptObj = scripts[ind]
-								totalScripts = totalScripts + 1
-
-								local relativeSegments = getRelativeFolderSegments(rootObj, scriptObj)
-								local scriptFolder = exportFolder
-								if relativeSegments and #relativeSegments > 0 then
-									scriptFolder = scriptFolder .. "/" .. concat(relativeSegments, "/")
-									ensureFolder(scriptFolder)
-								end
-
-								local stem = ("%s.%s"):format(
-									sanitizeFileName(scriptObj.Name),
-									sanitizeFileName(scriptObj.ClassName)
-								)
-								local scriptFile = scriptFolder
-									.. "/"
-									.. getUniqueFileName(folderNameMap, scriptFolder, stem)
-								local success, source = pcall(env.decompile, scriptObj)
-								local writeStateOk = success and type(source) == "string"
-								local output
-
-								if writeStateOk then
-									output = buildScriptHeader(scriptObj, exportedAt) .. source
-								else
-									output = buildScriptHeader(scriptObj, exportedAt)
-										.. ("-- Failed to decompile script.\n-- Error: %s\n"):format(tostring(source))
-								end
-
-								local writeSuccess, writeErr = pcall(env.writefile, scriptFile, output)
-								if not writeSuccess then
-									writeStateOk = false
-									warn("DEX folder export write failed: " .. tostring(writeErr))
-								end
-
-								if writeStateOk then
-									totalSuccess = totalSuccess + 1
-								else
-									totalFailed = totalFailed + 1
-								end
-							end
+							roots[#roots + 1] = sList[i].Obj
 						end
-
-						warn(
-							("DEX folder export completed | scripts=%i success=%i failed=%i"):format(
-								totalScripts,
-								totalSuccess,
-								totalFailed
-							)
-						)
+						exportDecompiledRoots(roots, "folder")
+					end,
+				})
+				context:Register("EXPORT_ALL_DECOMPILED_SCRIPTS", {
+					Name = "Export All Decompiled Scripts",
+					IconMap = Explorer.MiscIcons,
+					Icon = "Save",
+					OnClick = function()
+						exportDecompiledRoots({ game }, "all")
 					end,
 				})
 
@@ -3061,6 +3699,98 @@ local EmbeddedModules = {
 								end
 								--print("unblocking ",functionToHook)
 							end
+						end
+					end,
+				})
+				context:Register("EXPORT_REMOTE_INVENTORY", {
+					Name = "Export Remote Inventory",
+					IconMap = Explorer.MiscIcons,
+					Icon = "Save",
+					OnClick = function()
+						if env.writefile == nil or env.makefolder == nil then
+							return
+						end
+						local roots = {}
+						for i = 1, #selection.List do
+							roots[#roots + 1] = selection.List[i].Obj
+						end
+						local remotes = collectRemoteObjectsFromRoots(roots)
+						if #remotes == 0 then
+							warn("DEX remote inventory export skipped: no remotes found in selection")
+							return
+						end
+						local successCount, totalCount, session = exportRemoteInventory(remotes)
+						warn(
+							("DEX remote inventory export completed | remotes=%i success=%i folder=%s"):format(
+								totalCount,
+								successCount,
+								session and session.folder or "unknown"
+							)
+						)
+					end,
+				})
+				context:Register("START_REMOTE_EXPORT_ALL", {
+					Name = "Start Remote Export All",
+					IconMap = Explorer.MiscIcons,
+					Icon = "Play",
+					OnClick = function()
+						if env.writefile == nil or env.makefolder == nil or env.hookmetamethod == nil then
+							return
+						end
+						local remotes = collectRemoteObjectsFromRoots({ game })
+						if #remotes == 0 then
+							warn("DEX remote all skipped: no remotes found")
+							return
+						end
+						local started, info = startRemoteExportLogging(remotes)
+						if started then
+							warn(
+								("DEX remote all started | remotes=%i folder=%s"):format(
+									#remotes,
+									info and info.folder or "unknown"
+								)
+							)
+						else
+							warn("DEX remote all failed to start: " .. tostring(info))
+						end
+					end,
+				})
+				context:Register("START_REMOTE_EXPORT_LOG", {
+					Name = "Start Remote Export Log",
+					IconMap = Explorer.MiscIcons,
+					Icon = "Play",
+					OnClick = function()
+						if env.writefile == nil or env.makefolder == nil or env.hookmetamethod == nil then
+							return
+						end
+						local roots = {}
+						for i = 1, #selection.List do
+							roots[#roots + 1] = selection.List[i].Obj
+						end
+						local remotes = collectRemoteObjectsFromRoots(roots)
+						local started, info = startRemoteExportLogging(remotes)
+						if started then
+							warn(
+								("DEX remote export log started | remotes=%i folder=%s"):format(
+									#remotes,
+									info and info.folder or "unknown"
+								)
+							)
+						else
+							warn("DEX remote export log failed to start: " .. tostring(info))
+						end
+					end,
+				})
+				context:Register("STOP_REMOTE_EXPORT_LOG", {
+					Name = "Stop Remote Export Log",
+					IconMap = Explorer.MiscIcons,
+					Icon = "Pause",
+					OnClick = function()
+						local stopped = stopRemoteExportLogging()
+						if stopped then
+							warn("DEX remote export log stopped")
+						else
+							warn("DEX remote export log was not running")
 						end
 					end,
 				})
@@ -3625,7 +4355,7 @@ local EmbeddedModules = {
 					["remotes"] = function(argString)
 						return {
 							Headers = { "local isa = game.IsA" },
-							Predicate = "isa(obj,'RemoteEvent') or isa(obj,'RemoteFunction') or isa(obj,'UnreliableRemoteFunction')",
+							Predicate = "isa(obj,'RemoteEvent') or isa(obj,'RemoteFunction') or isa(obj,'UnreliableRemoteEvent')",
 						}
 					end,
 					["bindables"] = function(argString)
@@ -3902,16 +4632,13 @@ return search]==]
 					return nil, specFilterList
 				end
 
-				local env = setmetatable(
-					{
-						["searchResults"] = searchResults,
-						["nodes"] = nodes,
-						["Explorer"] = Explorer,
-						["specResults"] = specResults,
-						["service"] = service,
-					},
-					{ __index = getfenv() }
-				)
+				local env = setmetatable({
+					["searchResults"] = searchResults,
+					["nodes"] = nodes,
+					["Explorer"] = Explorer,
+					["specResults"] = specResults,
+					["service"] = service,
+				}, { __index = getfenv() })
 				setfenv(func, env)
 
 				return func(), specFilterList
@@ -4290,12 +5017,11 @@ return search]==]
 						{
 							1,
 							"Frame",
-							{ BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, Size = UDim2.new(
-								0,
-								100,
-								0,
-								100
-							) },
+							{
+								BackgroundColor3 = Color3.new(1, 1, 1),
+								BackgroundTransparency = 1,
+								Size = UDim2.new(0, 100, 0, 100),
+							},
 						},
 						{
 							2,
@@ -4577,8 +5303,115 @@ return search]==]
 					},
 				})
 
-				toolBar = explorerItems.ToolBar
-				treeFrame = explorerItems.List
+				toolBar = explorerItems:FindFirstChild("ToolBar")
+				treeFrame = explorerItems:FindFirstChild("List")
+				scrollCorner = explorerItems:FindFirstChild("ScrollCorner")
+
+				if not toolBar then
+					toolBar = createSimple("Frame", {
+						BackgroundColor3 = Color3.new(0.20392157137394, 0.20392157137394, 0.20392157137394),
+						BorderSizePixel = 0,
+						Name = "ToolBar",
+						Size = UDim2.new(1, 0, 0, 22),
+						Parent = explorerItems,
+					})
+					local searchFrame = createSimple("Frame", {
+						BackgroundColor3 = Color3.new(0.14901961386204, 0.14901961386204, 0.14901961386204),
+						BorderColor3 = Color3.new(0.1176470592618, 0.1176470592618, 0.1176470592618),
+						BorderSizePixel = 0,
+						Name = "SearchFrame",
+						Position = UDim2.new(0, 3, 0, 1),
+						Size = UDim2.new(1, -6, 0, 18),
+						Parent = toolBar,
+					})
+					createSimple("TextBox", {
+						BackgroundColor3 = Color3.new(1, 1, 1),
+						BackgroundTransparency = 1,
+						ClearTextOnFocus = false,
+						Font = 3,
+						Name = "SearchBox",
+						PlaceholderColor3 = Color3.new(0.39215689897537, 0.39215689897537, 0.39215689897537),
+						PlaceholderText = "Search workspace",
+						Position = UDim2.new(0, 4, 0, 0),
+						Size = UDim2.new(1, -24, 0, 18),
+						Text = "",
+						TextColor3 = Color3.new(1, 1, 1),
+						TextSize = 14,
+						TextXAlignment = 0,
+						Parent = searchFrame,
+					})
+					createSimple("UICorner", { CornerRadius = UDim.new(0, 2), Parent = searchFrame })
+					createSimple("UIStroke", { Thickness = 1.4, Color = Color3.fromRGB(42, 42, 42), Parent = searchFrame })
+					local resetButton = createSimple("TextButton", {
+						AutoButtonColor = false,
+						BackgroundColor3 = Color3.new(0.12549020349979, 0.12549020349979, 0.12549020349979),
+						BackgroundTransparency = 1,
+						BorderSizePixel = 0,
+						Font = 3,
+						Name = "Reset",
+						Position = UDim2.new(1, -17, 0, 1),
+						Size = UDim2.new(0, 16, 0, 16),
+						Text = "",
+						TextColor3 = Color3.new(1, 1, 1),
+						TextSize = 14,
+						Parent = searchFrame,
+					})
+					createSimple("ImageLabel", {
+						BackgroundColor3 = Color3.new(1, 1, 1),
+						BackgroundTransparency = 1,
+						Image = "rbxassetid://5034718129",
+						ImageColor3 = Color3.new(0.39215686917305, 0.39215686917305, 0.39215686917305),
+						Size = UDim2.new(0, 16, 0, 16),
+						Parent = resetButton,
+					})
+					local refreshButton = createSimple("TextButton", {
+						AutoButtonColor = false,
+						BackgroundColor3 = Color3.new(0.12549020349979, 0.12549020349979, 0.12549020349979),
+						BackgroundTransparency = 1,
+						BorderSizePixel = 0,
+						Font = 3,
+						Name = "Refresh",
+						Position = UDim2.new(1, -20, 0, 1),
+						Size = UDim2.new(0, 18, 0, 18),
+						Text = "",
+						TextColor3 = Color3.new(1, 1, 1),
+						TextSize = 14,
+						Visible = false,
+						Parent = toolBar,
+					})
+					createSimple("ImageLabel", {
+						BackgroundColor3 = Color3.new(1, 1, 1),
+						BackgroundTransparency = 1,
+						Image = "rbxassetid://5642310344",
+						Position = UDim2.new(0, 3, 0, 3),
+						Size = UDim2.new(0, 12, 0, 12),
+						Parent = refreshButton,
+					})
+				end
+
+				if not treeFrame then
+					treeFrame = createSimple("Frame", {
+						BackgroundColor3 = Color3.new(1, 1, 1),
+						BackgroundTransparency = 1,
+						ClipsDescendants = true,
+						Name = "List",
+						Position = UDim2.new(0, 0, 0, 23),
+						Size = UDim2.new(1, 0, 1, -23),
+						Parent = explorerItems,
+					})
+				end
+
+				if not scrollCorner then
+					scrollCorner = createSimple("Frame", {
+						BackgroundColor3 = Color3.new(0.15686275064945, 0.15686275064945, 0.15686275064945),
+						BorderSizePixel = 0,
+						Name = "ScrollCorner",
+						Position = UDim2.new(1, -16, 1, -16),
+						Size = UDim2.new(0, 16, 0, 16),
+						Visible = false,
+						Parent = explorerItems,
+					})
+				end
 
 				Explorer.GuiElems.ToolBar = toolBar
 				Explorer.GuiElems.TreeFrame = treeFrame
@@ -4608,7 +5441,7 @@ return search]==]
 				Explorer.InitEntryTemplate()
 				toolBar.Parent = window.GuiElems.Content
 				treeFrame.Parent = window.GuiElems.Content
-				explorerItems.ScrollCorner.Parent = window.GuiElems.Content
+				scrollCorner.Parent = window.GuiElems.Content
 				scrollV.Gui.Parent = window.GuiElems.Content
 				scrollH.Gui.Parent = window.GuiElems.Content
 
@@ -4617,6 +5450,81 @@ return search]==]
 				Explorer.InitSearch()
 				Explorer.InitDelCleaner()
 				selection.Changed:Connect(Explorer.UpdateSelectionVisuals)
+
+				local searchFrame = toolBar:FindFirstChild("SearchFrame")
+				if searchFrame then
+					searchFrame.Size = UDim2.new(1, -188, 0, 18)
+				end
+
+				local function ensureToolbarButton(buttonName, xOffset, defaultText)
+					local button = toolBar:FindFirstChild(buttonName)
+					if not button then
+						button = createSimple("TextButton", {
+							AutoButtonColor = false,
+							BackgroundColor3 = Color3.fromRGB(31, 31, 31),
+							BorderSizePixel = 0,
+							Font = 3,
+							Name = buttonName,
+							Position = UDim2.new(1, xOffset, 0, 1),
+							Size = UDim2.new(0, 88, 0, 18),
+							Text = defaultText,
+							TextColor3 = Color3.new(1, 1, 1),
+							TextSize = 14,
+							Parent = toolBar,
+						})
+						createSimple("UICorner", { CornerRadius = UDim.new(0, 2), Parent = button })
+					else
+						button.Position = UDim2.new(1, xOffset, 0, 1)
+						button.Size = UDim2.new(0, 88, 0, 18)
+						button.Text = defaultText
+					end
+					return button
+				end
+
+				local exportAllButton = ensureToolbarButton("ExportAll", -92, "Export All")
+				local canExportAll = env.decompile ~= nil and env.writefile ~= nil and env.makefolder ~= nil
+				if canExportAll then
+					exportAllButton.MouseButton1Click:Connect(function()
+						exportDecompiledRoots({ game }, "all")
+					end)
+				else
+					exportAllButton.Text = "Export Off"
+					exportAllButton.TextColor3 = Color3.fromRGB(130, 130, 130)
+					exportAllButton.Active = false
+				end
+
+				local remoteAllButton = ensureToolbarButton("RemoteAll", -184, "Remote All")
+				local canUseRemoteAll = env.writefile ~= nil and env.makefolder ~= nil and env.hookmetamethod ~= nil
+				if canUseRemoteAll then
+					remoteAllButton.MouseButton1Click:Connect(function()
+						if remote_export_active then
+							local stopped = stopRemoteExportLogging()
+							if stopped then
+								warn("DEX remote export log stopped")
+							end
+							return
+						end
+
+						local remotes = collectRemoteObjectsFromRoots({ game })
+						if #remotes == 0 then
+							warn("DEX remote all skipped: no remotes found")
+							return
+						end
+						local started, info = startRemoteExportLogging(remotes)
+						if started then
+							warn(
+								("DEX remote all started | remotes=%i folder=%s"):format(
+									#remotes,
+									info and info.folder or "unknown"
+								)
+							)
+						else
+							warn("DEX remote all failed to start: " .. tostring(info))
+						end
+					end)
+				end
+				updateExportToolbarButtonVisual()
+				updateRemoteToolbarButtonVisual()
 
 				-- Window events
 				window.GuiElems.Main:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
@@ -6777,28 +7685,25 @@ return search]==]
 				end
 
 				local function createFrame(self)
-					local newFrame = createSimple(
-						"Frame",
-						{
-							Style = 0,
-							Active = true,
-							AnchorPoint = Vector2.new(0, 0),
-							BackgroundColor3 = Color3.new(0.35294118523598, 0.35294118523598, 0.35294118523598),
-							BackgroundTransparency = 0,
-							BorderColor3 = Color3.new(0.10588236153126, 0.16470588743687, 0.20784315466881),
-							BorderSizePixel = 0,
-							ClipsDescendants = false,
-							Draggable = false,
-							Position = UDim2.new(1, -16, 0, 0),
-							Rotation = 0,
-							Selectable = false,
-							Size = UDim2.new(0, 16, 1, 0),
-							SizeConstraint = 0,
-							Visible = true,
-							ZIndex = 1,
-							Name = "ScrollBar",
-						}
-					)
+					local newFrame = createSimple("Frame", {
+						Style = 0,
+						Active = true,
+						AnchorPoint = Vector2.new(0, 0),
+						BackgroundColor3 = Color3.new(0.35294118523598, 0.35294118523598, 0.35294118523598),
+						BackgroundTransparency = 0,
+						BorderColor3 = Color3.new(0.10588236153126, 0.16470588743687, 0.20784315466881),
+						BorderSizePixel = 0,
+						ClipsDescendants = false,
+						Draggable = false,
+						Position = UDim2.new(1, -16, 0, 0),
+						Rotation = 0,
+						Selectable = false,
+						Size = UDim2.new(0, 16, 1, 0),
+						SizeConstraint = 0,
+						Visible = true,
+						ZIndex = 1,
+						Name = "ScrollBar",
+					})
 					local button1, button2
 
 					if self.Horizontal then
@@ -10577,10 +11482,8 @@ return search]==]
 								local _, endPos = find(lineText, "%x+", col)
 								local endPart = sub(lineText, endPos, endPos + 1)
 								if
-									(endPart == "e+" or endPart == "e-") and find(
-										sub(lineText, endPos + 2, endPos + 2),
-										"%d"
-									)
+									(endPart == "e+" or endPart == "e-")
+									and find(sub(lineText, endPos + 2, endPos + 2), "%d")
 								then
 									endPos = endPos + 1
 								end
@@ -11725,12 +12628,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 8, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 7 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							8,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 7 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							9,
 							"Frame",
@@ -11781,12 +12688,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 13, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 12 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							13,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 12 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							14,
 							"Frame",
@@ -11988,12 +12899,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 29, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 28 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							29,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 28 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							30,
 							"Frame",
@@ -12044,12 +12959,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 34, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 33 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							34,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 33 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							35,
 							"Frame",
@@ -12159,12 +13078,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 43, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 42 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							43,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 42 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							44,
 							"Frame",
@@ -12215,12 +13138,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 48, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 47 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							48,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 47 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							49,
 							"Frame",
@@ -12342,12 +13269,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 58, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 57 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							58,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 57 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							59,
 							"Frame",
@@ -12398,12 +13329,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 63, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 62 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							63,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 62 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							64,
 							"Frame",
@@ -12513,12 +13448,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 72, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 71 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							72,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 71 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							73,
 							"Frame",
@@ -12569,12 +13508,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 77, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 76 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							77,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 76 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							78,
 							"Frame",
@@ -12684,12 +13627,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 86, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 85 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							86,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 85 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							87,
 							"Frame",
@@ -12740,12 +13687,16 @@ return search]==]
 								TextSize = 14,
 							},
 						},
-						{ 91, "Frame", { BackgroundTransparency = 1, Name = "Arrow", Parent = { 90 }, Size = UDim2.new(
-							0,
-							16,
-							0,
-							8
-						) } },
+						{
+							91,
+							"Frame",
+							{
+								BackgroundTransparency = 1,
+								Name = "Arrow",
+								Parent = { 90 },
+								Size = UDim2.new(0, 16, 0, 8),
+							},
+						},
 						{
 							92,
 							"Frame",
@@ -15088,16 +16039,13 @@ return search]==]
 
 					local obj = initObj(props, mt)
 					obj.Gui = b
-					obj.Anim = Lib.ButtonAnim(
-						b,
-						{
-							Mode = 2,
-							StartColor = Settings.Theme.Button,
-							HoverColor = Settings.Theme.ButtonHover,
-							PressColor = Settings.Theme.ButtonPress,
-							OutlineColor = Settings.Theme.Outline2,
-						}
-					)
+					obj.Anim = Lib.ButtonAnim(b, {
+						Mode = 2,
+						StartColor = Settings.Theme.Button,
+						HoverColor = Settings.Theme.ButtonHover,
+						PressColor = Settings.Theme.ButtonPress,
+						OutlineColor = Settings.Theme.Outline2,
+					})
 
 					b.MouseButton1Click:Connect(function()
 						obj:Trigger("Click", 1)
@@ -15266,15 +16214,12 @@ return search]==]
 
 					local obj = initObj(props, mt)
 					obj.Gui = f
-					obj.Anim = Lib.ButtonAnim(
-						f,
-						{
-							Mode = 2,
-							StartColor = Settings.Theme.TextBox,
-							LerpTo = Settings.Theme.Button,
-							LerpDelta = 0.15,
-						}
-					)
+					obj.Anim = Lib.ButtonAnim(f, {
+						Mode = 2,
+						StartColor = Settings.Theme.TextBox,
+						LerpTo = Settings.Theme.Button,
+						LerpDelta = 0.15,
+					})
 					obj.Context = Lib.ContextMenu.new()
 					obj.Context.Iconless = true
 					obj.Context.MaxHeight = 200
